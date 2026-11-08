@@ -133,6 +133,9 @@ static volatile uint8_t m_need_gap = 0;
 static volatile uint8_t m_skip = 0;
 static volatile uint8_t m_pkt = 0;
 static volatile uint8_t m_drop = 0;
+static volatile uint8_t m_btn = 0;
+static volatile uint8_t m_btn_pend = 0;
+static uint8_t btn_cur = 0;
 static volatile uint16_t m_edge = 0;
 static volatile uint16_t m_byte_at = 0;
 
@@ -244,6 +247,16 @@ void quad_step(void) {
 }
 
 void buttons_set(uint8_t btn) {
+  btn &= 0x03;
+  /* Windows 3.0 counts a double click only if the cursor is still.
+     The steps already queued keep it sliding after the hand has
+     stopped, so the second click becomes a drag. Drop that tail
+     on the press and on the release. */
+  if (btn != btn_cur) {
+    pend_x = 0;
+    pend_y = 0;
+    btn_cur = btn;
+  }
   if (btn & 0x01) bus_low(BUS_L); else bus_rel(BUS_L);
   if (btn & 0x02) rbtn(1); else rbtn(0);
 }
@@ -287,6 +300,16 @@ void mouse_parse(void) {
   static uint8_t pi = 0;
   uint8_t b;
   uint8_t sreg;
+  if (m_btn_pend) {
+    sreg = SREG;
+    cli();
+    b = m_btn;
+    m_btn_pend = 0;
+    SREG = sreg;
+    /* The click is in the status byte. Put it on the pins before a
+       later parity error flushes the rest of the packet. */
+    buttons_set(b);
+  }
   if (m_err) {
     sreg = SREG;
     cli();
@@ -384,6 +407,10 @@ void mouse_isr(void) {
     m_drop--;
     m_clk = 11;
     return;
+  }
+  if (m_pkt == 0) {
+    m_btn = (uint8_t)(m_acc & 0x03);
+    m_btn_pend = 1;
   }
   mq_push(m_acc, m_pkt == 0);
   if (m_pkt < 2) m_pkt++;
@@ -575,6 +602,8 @@ uint8_t mouse_init(void) {
   m_skip = 0;
   m_pkt = 0;
   m_drop = 0;
+  m_btn = 0;
+  m_btn_pend = 0;
   /* The mouse is already streaming before the interrupt is attached.
      Ignore clocks until the line has been idle, so the first queued
      byte is a status byte and not the middle of a packet. */
