@@ -21,7 +21,7 @@
 //   D2  PD2   INT0        PS/2 мышь clock,    mini-DIN-6 pin 5
 //   D3  PD3   INT1        PS/2 клавиатура clock, mini-DIN-6 pin 5
 //   D4  PD4   вход        PC-98 ~RTY, mini-DIN-8 pin 5
-//   D5  PD5   R           DB9 pin 8, правая кнопка, открытый коллектор
+//   D5  PD5   не занимать: рядом с D8 (XA), наводка даёт ложный правый клик
 //   D6  PD6   вход        PC-98 ~RST, mini-DIN-8 pin 1
 //   D7  PD7   вход        PC-98 ~RDY, mini-DIN-8 pin 3
 //   D8  PB0   XA          DB9 pin 2, открытый коллектор + 10 кОм на 5V
@@ -32,24 +32,27 @@
 //   D13 PB5   не занимать: светодиод платы сажает открытый коллектор
 //   A0  PC0               PS/2 мышь data,       mini-DIN-6 pin 1
 //   A1  PC1               PS/2 клавиатура data, mini-DIN-6 pin 1
-//   A2..A5                свободны
+//   A2  PC2   R           DB9 pin 8, правая кнопка, открытый коллектор + 10 кОм
+//   A3..A5                свободны
 //   A6 A7                 только АЦП, не использовать
 //
 // DB9 pin 7 не подключать. GND: mini-DIN-8 pin 2, DB9 pin 9, оба PS/2 pin 3.
 // +5 В на оба PS/2 pin 4 с той же шины, что питает Nano.
 // На clock и data каждой PS/2 по 10 кОм на +5 В.
 //
-// Сброс DEBUG: лог в USB-serial 57600 8N1. Тот же UART, что и клавиатура
+// Сброс DEBUG: лог в USB-serial 115200 8N1. Тот же UART, что и клавиатура
 // PC-98, поэтому при DEBUG передача в машину выключена.
 // В мониторе порта строки мыши: M <байты> x <dx> y <dy>
 ////////////////////////////////////////////////////////////////////////////////
 
 //#define DEBUG
 
-#define PHASE_X_US 150
-#define PHASE_Y_US 175
-#define MOUSE_MAX_STEP 20
-#define PEND_MAX 60
+/* Same step time as ps2busmouse98-2. That sketch moved. Holding a
+   phase for 500 us while discarding most packets does not: a centimetre
+   a second is a few dozen steps, which is what the gap filter left. */
+#define PHASE_US 150
+#define MOUSE_SCALE 1
+#define PEND_MAX 255
 
 #define pc98tm 0x22
 #define numlock
@@ -64,8 +67,24 @@
 #define BUS_YB _BV(3)
 #define BUS_L  _BV(4)
 #define BUS_ALL ((uint8_t)(BUS_XA | BUS_XB | BUS_YA | BUS_YB | BUS_L))
-#define RBTN_LO() do { PORTD &= (uint8_t)~_BV(5); DDRD |= _BV(5); } while (0)
-#define RBTN_HI() do { DDRD &= (uint8_t)~_BV(5); PORTD &= (uint8_t)~_BV(5); } while (0)
+/* Right button is A2 / PC2, not D5. D5 sits on the same header row as D8
+   (XA). While XA toggles, the PC-98 sees a false right click and one
+   quadrature sample comes out backwards: a small kick, a few times per
+   screen. Straight up does not toggle XA, so it stays clean.
+   PORTC is also the PS/2 data port. The read-modify-write is under cli
+   so a keyboard interrupt cannot clear PC0/PC1. */
+void rbtn(uint8_t pressed) {
+  uint8_t s = SREG;
+  cli();
+  if (pressed) {
+    PORTC &= (uint8_t)~_BV(2);
+    DDRC |= _BV(2);
+  } else {
+    DDRC &= (uint8_t)~_BV(2);
+    PORTC &= (uint8_t)~_BV(2);
+  }
+  SREG = s;
+}
 
 // PS/2 clock: PD2 мышь, PD3 клавиатура. Data: PC0 мышь, PC1 клавиатура.
 #define KCLK_LO() do { PORTD &= (uint8_t)~_BV(3); DDRD |= _BV(3); } while (0)
@@ -102,19 +121,33 @@ static volatile uint8_t kq_r = 0;
 static volatile uint16_t kbd_edge = 0;
 
 static volatile uint8_t mq[32];
+static volatile uint8_t mq_sync[32];
 static volatile uint8_t mq_w = 0;
 static volatile uint8_t mq_r = 0;
-static volatile uint8_t m_clk = 10;
+static volatile uint8_t m_clk = 11;
 static volatile uint8_t m_acc = 0;
+static volatile uint8_t m_par = 0;
+static volatile uint8_t m_bad = 0;
+static volatile uint8_t m_err = 0;
+static volatile uint8_t m_need_gap = 0;
+static volatile uint8_t m_skip = 0;
+static volatile uint8_t m_pkt = 0;
+static volatile uint8_t m_drop = 0;
 static volatile uint16_t m_edge = 0;
+static volatile uint16_t m_byte_at = 0;
 
 static uint8_t mouse_ok = 0;
+static uint32_t mouse_try_at = 0;
 static uint8_t mouse_id = 0;
 static uint8_t mouse_len = 3;
 static int16_t pend_x = 0;
 static int16_t pend_y = 0;
-static int8_t st_x = 0;
-static int8_t st_y = 0;
+/* Phase is the code currently on the wires.
+   X phase 3 and Y phase 0 are both lines released, which is how the
+   port comes out of reset. */
+static uint8_t st_x = 3;
+static uint8_t st_y = 0;
+static uint8_t quad_axis = 0;
 static uint32_t quad_next = 0;
 
 void kq_push(uint8_t b) {
@@ -139,33 +172,53 @@ uint8_t kq_pop(uint8_t *b) {
   return 1;
 }
 
-void mq_push(uint8_t b) {
+void mq_push(uint8_t b, uint8_t sync) {
   uint8_t n = (uint8_t)((mq_w + 1) & MQ_MASK);
-  if (n != mq_r) {
-    mq[mq_w] = b;
-    mq_w = n;
+  if (n == mq_r) {
+    m_err = 1;
+    return;
   }
+  mq[mq_w] = b;
+  mq_sync[mq_w] = sync;
+  mq_w = n;
 }
 
-void bus_low(uint8_t m) { DDRB |= m; }
-void bus_rel(uint8_t m) { DDRB &= (uint8_t)~m; }
+void bus_low(uint8_t m) { PORTB &= (uint8_t)~m; DDRB |= m; }
+void bus_rel(uint8_t m) { DDRB &= (uint8_t)~m; PORTB &= (uint8_t)~m; }
 
-void x_out(int8_t s) {
-  switch (s & 3) {
-    case 0: bus_low(BUS_XA); bus_rel(BUS_XB); break;
-    case 1: bus_low(BUS_XA); bus_low(BUS_XB); break;
-    case 2: bus_rel(BUS_XA); bus_low(BUS_XB); break;
-    default: bus_rel(BUS_XA); bus_rel(BUS_XB); break;
-  }
+/* Drive both lines of one axis with a single DDRB store.
+   PORTB stays 0, so DDR=1 is open-drain low and DDR=0 releases. */
+void axis_put(uint8_t axis, uint8_t low) {
+  uint8_t d = DDRB;
+  d &= (uint8_t)~axis;
+  d |= low;
+  DDRB = d;
 }
 
-void y_out(int8_t s) {
+/* +X walks 3 -> 0 -> 1 -> 2 -> 3. Same cycle as the old table,
+   but the phase variable is the code already on the pins. */
+void x_set(uint8_t s) {
+  uint8_t lo;
   switch (s & 3) {
-    case 3: bus_low(BUS_YA); bus_rel(BUS_YB); break;
-    case 2: bus_low(BUS_YA); bus_low(BUS_YB); break;
-    case 1: bus_rel(BUS_YA); bus_low(BUS_YB); break;
-    default: bus_rel(BUS_YA); bus_rel(BUS_YB); break;
+    case 0: lo = BUS_XA; break;
+    case 1: lo = (uint8_t)(BUS_XA | BUS_XB); break;
+    case 2: lo = BUS_XB; break;
+    default: lo = 0; break;
   }
+  axis_put((uint8_t)(BUS_XA | BUS_XB), lo);
+}
+
+/* +Y walks 0 -> 1 -> 2 -> 3. Phase order is the reverse of X,
+   which is what the PC-98 screen expects. */
+void y_set(uint8_t s) {
+  uint8_t lo;
+  switch (s & 3) {
+    case 3: lo = BUS_YA; break;
+    case 2: lo = (uint8_t)(BUS_YA | BUS_YB); break;
+    case 1: lo = BUS_YB; break;
+    default: lo = 0; break;
+  }
+  axis_put((uint8_t)(BUS_YA | BUS_YB), lo);
 }
 
 void quad_step(void) {
@@ -174,38 +227,41 @@ void quad_step(void) {
   if (!pend_x && !pend_y) return;
   now = micros();
   if ((int32_t)(now - quad_next) < 0) return;
-  if (pend_x) {
+  if (pend_x && (!pend_y || quad_axis == 0)) {
     inc = (pend_x > 0) ? 1 : -1;
     pend_x = (int16_t)(pend_x - inc);
-    x_out(st_x);
-    st_x = (int8_t)(st_x + inc);
-    if (st_x < 0) st_x = 3;
-    if (st_x > 3) st_x = 0;
-    quad_next = now + PHASE_X_US;
+    st_x = (uint8_t)((st_x + inc) & 3);
+    x_set(st_x);
+    quad_axis = 1;
   } else {
     inc = (pend_y > 0) ? 1 : -1;
     pend_y = (int16_t)(pend_y - inc);
-    y_out(st_y);
-    st_y = (int8_t)(st_y + inc);
-    if (st_y < 0) st_y = 3;
-    if (st_y > 3) st_y = 0;
-    quad_next = now + PHASE_Y_US;
+    st_y = (uint8_t)((st_y + inc) & 3);
+    y_set(st_y);
+    quad_axis = 0;
   }
+  quad_next = now + PHASE_US;
+}
+
+void buttons_set(uint8_t btn) {
+  if (btn & 0x01) bus_low(BUS_L); else bus_rel(BUS_L);
+  if (btn & 0x02) rbtn(1); else rbtn(0);
 }
 
 void mouse_apply(const uint8_t *pkt) {
   int16_t dx;
   int16_t dy;
-  if (pkt[0] & 0x01) bus_low(BUS_L); else bus_rel(BUS_L);
-  if (pkt[0] & 0x02) RBTN_LO(); else RBTN_HI();
+  /* One packet is the whole press or release. Many mice send that
+     packet once and then go quiet. Waiting for a second copy left
+     D12 driven low after the finger was already up. */
+  buttons_set((uint8_t)(pkt[0] & 0x03));
+  /* 9-bit two's complement: low 8 bits in the data byte, sign in status. */
   dx = pkt[1];
   dy = pkt[2];
-  if (pkt[0] & 0x10) dx |= (int16_t)0xFF00;
-  if (pkt[0] & 0x20) dy |= (int16_t)0xFF00;
-  if (dx > MOUSE_MAX_STEP) dx = MOUSE_MAX_STEP;
-  if (dx < -MOUSE_MAX_STEP) dx = -MOUSE_MAX_STEP;
-  if (dy > MOUSE_MAX_STEP) dy = MOUSE_MAX_STEP;
-  if (dy < -MOUSE_MAX_STEP) dy = -MOUSE_MAX_STEP;
+  if (pkt[0] & 0x10) dx = (int16_t)(dx - 256);
+  if (pkt[0] & 0x20) dy = (int16_t)(dy - 256);
+  dx = (int16_t)(dx * MOUSE_SCALE);
+  dy = (int16_t)(dy * MOUSE_SCALE);
   pend_x = (int16_t)(pend_x + dx);
   pend_y = (int16_t)(pend_y + dy);
   if (pend_x > PEND_MAX) pend_x = PEND_MAX;
@@ -230,16 +286,32 @@ void mouse_parse(void) {
   static uint8_t pkt[4];
   static uint8_t pi = 0;
   uint8_t b;
-  while (mq_r != mq_w) {
-    b = mq[mq_r];
-    mq_r = (uint8_t)((mq_r + 1) & MQ_MASK);
-    if (pi == 0 && (b & 0x08) == 0) {
+  uint8_t sreg;
+  if (m_err) {
+    sreg = SREG;
+    cli();
+    m_err = 0;
+    mq_r = mq_w;
+    SREG = sreg;
+    /* One bad frame. Drop what was already queued from that packet.
+       The interrupt itself discards the rest of the trio, so the next
+       byte in the queue is a real status, not X or Y. */
+    pi = 0;
 #ifdef DEBUG
-      Serial.print(F("M skip "));
-      Serial.println(b, HEX);
+    Serial.println(F("M drop"));
 #endif
-      continue;
-    }
+  }
+  if (pi && (uint16_t)((uint16_t)micros() - m_byte_at) > 4000) pi = 0;
+  while (mq_r != mq_w) {
+    uint8_t sync;
+    b = mq[mq_r];
+    sync = mq_sync[mq_r];
+    mq_r = (uint8_t)((mq_r + 1) & MQ_MASK);
+    /* sync marks the status slot. A movement byte often has bit 3 set,
+       and its low bits are then a phantom button. Bits 4 and 5 of that
+       same byte are the sign bits, so the cursor jumps down-left. */
+    if (sync) pi = 0;
+    if (pi == 0 && (!sync || (b & 0x08) == 0)) continue;
     pkt[pi++] = b;
     if (pi >= mouse_len) {
       mouse_apply(pkt);
@@ -256,22 +328,68 @@ void idle(uint16_t ms) {
   }
 }
 
-// Поток PS/2: 11 спадов clock на байт. Первый после паузы ? старт, его не копим.
+/* Eleven falling clocks: start, 8 data, odd parity, stop.
+   A bad parity frame is not queued, and only its stop edge is skipped.
+   Waiting for the clock to go idle after that error ate the rest of a
+   moving stream, which is why the cursor crawled. */
 void mouse_isr(void) {
   uint8_t bit = MDAT_BIT();
   uint16_t now = (uint16_t)micros();
   uint8_t gap = (uint16_t)(now - m_edge) > 2000;
   m_edge = now;
+  if (m_need_gap) {
+    if (!gap) return;
+    m_need_gap = 0;
+    m_clk = 11;
+  }
+  if (m_skip) {
+    m_skip = 0;
+    m_clk = 11;
+    return;
+  }
   if (gap || m_clk > 9) {
+    if (gap) {
+      m_pkt = 0;
+      m_drop = 0;
+    }
     m_clk = 0;
     m_acc = 0;
+    m_par = 0;
     return;
   }
   if (m_clk < 8) {
-    m_acc |= (uint8_t)((unsigned)bit << m_clk);
-    if (m_clk == 7) mq_push(m_acc);
+    if (bit) {
+      m_acc |= (uint8_t)(1u << m_clk);
+      m_par ^= 1;
+    }
+    m_clk++;
+    return;
   }
-  m_clk++;
+  if (m_clk == 8) {
+    if (bit == m_par) {
+      /* Drop the rest of this 3-byte packet. Do not wait for the
+         clock to go idle: that threw away the whole swipe. */
+      m_err = 1;
+      m_skip = 1;
+      if (m_pkt < 2) m_drop = (uint8_t)(2 - m_pkt);
+      else m_drop = 0;
+      m_pkt = 0;
+      m_clk = 11;
+      return;
+    }
+    m_clk = 9;
+    return;
+  }
+  if (m_drop) {
+    m_drop--;
+    m_clk = 11;
+    return;
+  }
+  mq_push(m_acc, m_pkt == 0);
+  if (m_pkt < 2) m_pkt++;
+  else m_pkt = 0;
+  m_byte_at = now;
+  m_clk = 11;
 }
 
 void kbd_isr(void) {
@@ -437,34 +555,44 @@ void mouse_rate(uint8_t rate) {
 
 uint8_t mouse_init(void) {
   int bat;
-  int ack;
-  int id;
   m_idle();
   if (!mouse_write(0xFF)) return 0;
   bat = mouse_read();
   if (bat < 0 || bat == 0xFC) return 0;
   (void)mouse_read();
-  mouse_rate(200);
-  mouse_rate(100);
-  mouse_rate(80);
+  /* Leave the rate at the reset default, 100. The original sketch
+     only sent F4. Forcing 200 packed the bytes so close that the
+     idle-gap filter treated a moving mouse as a broken frame. */
   mouse_id = 0;
-  if (mouse_write(0xF2)) {
-    ack = mouse_read();
-    id = mouse_read();
-    if (ack == 0xFA && id >= 0) mouse_id = (uint8_t)id;
-  }
+  mouse_len = 3;
   if (!mouse_write(0xF4)) return 0;
   (void)mouse_read();
-  mouse_len = (mouse_id == 0x03 || mouse_id == 0x04) ? 4 : 3;
-  m_clk = 10;
+  m_clk = 11;
   m_acc = 0;
+  m_par = 0;
+  m_bad = 0;
+  m_err = 0;
+  m_skip = 0;
+  m_pkt = 0;
+  m_drop = 0;
+  /* The mouse is already streaming before the interrupt is attached.
+     Ignore clocks until the line has been idle, so the first queued
+     byte is a status byte and not the middle of a packet. */
+  m_need_gap = 1;
+  m_edge = (uint16_t)micros();
   mq_r = mq_w = 0;
+  pend_x = 0;
+  pend_y = 0;
+  st_x = 3;
+  st_y = 0;
   return 1;
 }
 
 void ports_init(void) {
   PORTB &= (uint8_t)~(BUS_ALL | _BV(5));
   DDRB &= (uint8_t)~(BUS_ALL | _BV(5));
+  /* D5 is unused. Leave it floating so the old right-button wire,
+     if it is still soldered there, is not driven next to XA. */
   DDRD &= (uint8_t)~_BV(5);
   PORTD &= (uint8_t)~_BV(5);
   // ~RST ~RDY ~RTY: вход с подтяжкой, активный уровень низкий, его даёт хост.
@@ -474,6 +602,7 @@ void ports_init(void) {
   KDAT_HI();
   MCLK_HI();
   MDAT_HI();
+  rbtn(0);
 }
 
 void ps2send(uint8_t command) {
@@ -1003,28 +1132,37 @@ void kbd_poll(void) {
   else convymsp();
 }
 
+/* Power-on from the PC-98 rail is slow. The keyboard just sends
+   scancodes, so it works immediately. The mouse answers 0xFF only
+   after its own reset, which is often later than setup(). Two tries
+   there used to be the end of it, and the mouse stayed silent until
+   the Arduino reset button, by which time the mouse was already up. */
+void mouse_try(void) {
+  if (mouse_ok) return;
+  if (mouse_try_at && (uint32_t)(millis() - mouse_try_at) < 500) return;
+  mouse_try_at = millis();
+  if (!mouse_init()) return;
+  mouse_ok = 1;
+  EIFR = (1 << INTF0);
+  attachInterrupt(digitalPinToInterrupt(2), mouse_isr, FALLING);
+#ifdef DEBUG
+  Serial.print(F("mouse id "));
+  Serial.print(mouse_id, HEX);
+  Serial.print(F(" len "));
+  Serial.println(mouse_len);
+#endif
+}
+
 void setup(void) {
-  uint8_t try_n;
   ports_init();
 #ifdef DEBUG
-  Serial.begin(57600);
+  Serial.begin(115200);
   Serial.println(F("PC98dualPS2"));
 #else
   Serial.begin(19200, SERIAL_8O1);
 #endif
-  delay(1000);
-  mouse_ok = 0;
-  for (try_n = 0; try_n < 2 && !mouse_ok; try_n++) mouse_ok = mouse_init();
-#ifdef DEBUG
-  if (!mouse_ok) Serial.println(F("mouse: no"));
-  else {
-    Serial.print(F("mouse id "));
-    Serial.print(mouse_id, HEX);
-    Serial.print(F(" len "));
-    Serial.println(mouse_len);
-  }
-#endif
-  if (mouse_ok) attachInterrupt(digitalPinToInterrupt(2), mouse_isr, FALLING);
+  delay(400);
+  mouse_try();
   tmset();
 #ifdef numlock
   status &= (uint8_t)~0x04;
@@ -1036,6 +1174,7 @@ void setup(void) {
 }
 
 void loop(void) {
+  mouse_try();
   mouse_parse();
   quad_step();
   kbd_poll();
