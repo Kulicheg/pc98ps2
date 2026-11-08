@@ -1,8 +1,7 @@
 
 Проект является компиляцией двух отдельных проектов
 
-https://github.com/z4ke/ps2topc98
-https://github.com/tyama501/ps2busmouse98
+https://github.com/z4ke/ps2topc98 и https://github.com/tyama501/ps2busmouse98
 
 # PC98dualPS2
 Одна Arduino Nano одновременно переводит PS/2-клавиатуру в клавиатуру PC-98 и PS/2-мышь в шинную мышь PC-98.
